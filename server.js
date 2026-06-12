@@ -27,9 +27,30 @@ const pool = mysql.createPool({
 async function initDatabase() {
   try {
     await pool.execute('SELECT 1');
+    await ensureUsersIdColumn();
     console.log('Database connection OK');
   } catch (error) {
     console.error('Database connection error:', error);
+  }
+}
+
+async function ensureUsersIdColumn() {
+  try {
+    const [rows] = await pool.execute(`
+      SELECT CHARACTER_MAXIMUM_LENGTH AS maxLen
+      FROM information_schema.columns
+      WHERE table_schema = DATABASE()
+        AND table_name = 'users'
+        AND column_name = 'id'
+      LIMIT 1
+    `);
+    const maxLen = rows && rows[0] ? Number(rows[0].maxLen) : null;
+    if (Number.isFinite(maxLen) && maxLen < 14) {
+      await pool.execute(`ALTER TABLE users MODIFY COLUMN id VARCHAR(32)`);
+      console.log('Upgraded users.id to VARCHAR(32)');
+    }
+  } catch (error) {
+    console.error('ensureUsersIdColumn error:', error);
   }
 }
 
@@ -65,16 +86,23 @@ app.get('/api/products', async (req, res) => {
       LEFT JOIN cooking_methods cm ON best_cm.method_id = cm.method_id
     `);
 
-    // Get taste mappings for each product
-    for (let product of rows) {
+    const productIds = rows.map(row => row.id);
+    if (productIds.length > 0) {
+      const productPlaceholders = productIds.map(() => '?').join(',');
       const [tastes] = await pool.execute(`
         SELECT tm.product_id as riceId, tm.taste_id as tasteId, tm.score,
                tp.taste_name as indicatorName, tp.description as tasteDesc
         FROM rice_taste_mapping tm
         JOIN taste_profiles tp ON tm.taste_id = tp.taste_id
-        WHERE tm.product_id = ?
-      `, [product.id]);
-      product.tastes = tastes;
+        WHERE tm.product_id IN (${productPlaceholders})
+      `, productIds);
+
+      const tastesByProduct = new Map();
+      for (const taste of tastes) {
+        const list = tastesByProduct.get(taste.riceId) || [];
+        list.push(taste);
+        tastesByProduct.set(taste.riceId, list);
+      }
 
       const [cookings] = await pool.execute(`
         SELECT rcm.product_id as riceId, rcm.method_id as cookingId,
@@ -83,9 +111,25 @@ app.get('/api/products', async (req, res) => {
                cmm.description as cookingDesc
         FROM rice_cooking_mapping rcm
         JOIN cooking_methods cmm ON rcm.method_id = cmm.method_id
-        WHERE rcm.product_id = ?
-      `, [product.id]);
-      product.cookings = cookings;
+        WHERE rcm.product_id IN (${productPlaceholders})
+      `, productIds);
+
+      const cookingsByProduct = new Map();
+      for (const cooking of cookings) {
+        const list = cookingsByProduct.get(cooking.riceId) || [];
+        list.push(cooking);
+        cookingsByProduct.set(cooking.riceId, list);
+      }
+
+      for (const product of rows) {
+        product.tastes = tastesByProduct.get(product.id) || [];
+        product.cookings = cookingsByProduct.get(product.id) || [];
+      }
+    } else {
+      for (const product of rows) {
+        product.tastes = [];
+        product.cookings = [];
+      }
     }
 
     res.json(rows);

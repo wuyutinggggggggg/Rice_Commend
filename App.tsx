@@ -42,6 +42,45 @@ const NavItem: React.FC<{ icon: any; label: string; active: boolean; onClick: ()
 );
 
 // 预览面板
+const toTastePercent = (score: unknown) => {
+  const raw = Number(score);
+  if (!Number.isFinite(raw)) return 0;
+  // 数据库中的score已经是0-100的值，直接使用
+  return Math.max(0, Math.min(100, Math.round(raw)));
+};
+
+const getTastePercent = (
+  product: RiceProduct | null,
+  indicatorNames: string[],
+  tasteIds: string[] = []
+) => {
+  if (!product?.tastes?.length) return 0;
+  const normalizeId = (id: unknown) => {
+    const str = String(id ?? '');
+    const digits = str.replace(/\D/g, '');
+    return digits ? Number(digits) : null;
+  };
+  const targetNums = tasteIds
+    .map(id => normalizeId(id))
+    .filter((v): v is number => Number.isFinite(v as number));
+
+  const byName = product.tastes.find(t => {
+    const name = String(t.tasteProfile?.indicatorName || '').trim();
+    return indicatorNames.some(ind => name.includes(ind));
+  });
+  if (byName) return toTastePercent(byName.score);
+  const byId = product.tastes.find(t =>
+    tasteIds.includes(String(t.tasteId)) ||
+    (normalizeId(t.tasteId) != null && targetNums.includes(normalizeId(t.tasteId)!)) ||
+    (t.tasteProfile?.id != null && (
+      tasteIds.includes(String(t.tasteProfile.id)) ||
+      (normalizeId(t.tasteProfile.id) != null && targetNums.includes(normalizeId(t.tasteProfile.id)!))
+    ))
+  );
+  if (byId) return toTastePercent(byId.score);
+  return 0;
+};
+
 const PreviewPanel: React.FC<{ 
   product: RiceProduct | null; 
   isFavorite: boolean; 
@@ -59,6 +98,9 @@ const PreviewPanel: React.FC<{
       </div>
     );
   }
+
+  const softnessPercent = getTastePercent(product, ['软糯度'], ['T001', '1', '01']);
+  const aromaPercent = getTastePercent(product, ['米香值', '米香浓度', '香气浓郁'], ['T002', '2', '02']);
 
   return (
     <div className="h-full bg-white rounded-3xl border border-gray-100 shadow-xl overflow-hidden flex flex-col animate-in slide-in-from-right-4 duration-300">
@@ -108,19 +150,19 @@ const PreviewPanel: React.FC<{
            <div className="space-y-2">
               <div className="flex items-center justify-between">
                  <span className="text-[10px] font-bold text-gray-500">口感软糯度</span>
-                 <span className="text-[10px] font-black text-emerald-600">{product.textureScore}%</span>
+                 <span className="text-[10px] font-black text-emerald-600">{softnessPercent}%</span>
               </div>
               <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                 <div className="h-full bg-emerald-500 transition-all duration-1000" style={{ width: `${product.textureScore}%` }}></div>
+                 <div className="h-full bg-emerald-500 transition-all duration-1000" style={{ width: `${softnessPercent}%` }}></div>
               </div>
            </div>
            <div className="space-y-2">
               <div className="flex items-center justify-between">
                  <span className="text-[10px] font-bold text-gray-500">米香浓度</span>
-                 <span className="text-[10px] font-black text-amber-500">{product.aromaScore}%</span>
+                 <span className="text-[10px] font-black text-amber-500">{aromaPercent}%</span>
               </div>
               <div className="w-full h-1.5 bg-gray-100 rounded-full overflow-hidden">
-                 <div className="h-full bg-amber-500 transition-all duration-1000" style={{ width: `${product.aromaScore}%` }}></div>
+                 <div className="h-full bg-amber-500 transition-all duration-1000" style={{ width: `${aromaPercent}%` }}></div>
               </div>
            </div>
         </div>

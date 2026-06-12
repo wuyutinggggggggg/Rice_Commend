@@ -1,8 +1,7 @@
 import { GoogleGenAI, Type } from "@google/genai";
 import OpenAI from 'openai';
-import { UserPreferences, RecommendationResponse, RiceProduct } from "../../types.ts";
+import { UserPreferences, RecommendationResponse, RiceProduct, RiceTexture, RiceGrainLength } from "../../types.ts";
 
-// 简单的内存缓存，避免重复AI调用
 const cache = new Map<string, any>();
 
 const getCacheKey = (type: string, prefs: any, inventory: RiceProduct[]) => {
@@ -25,7 +24,7 @@ const getDeepSeekClient = () => {
     throw new Error('DEEPSEEK_API_KEY is not defined');
   }
   return new OpenAI({
-    apiKey: apiKey,
+    apiKey,
     baseURL: 'https://api.deepseek.com',
   });
 };
@@ -44,9 +43,118 @@ const recommendationSchema = {
         required: ["id", "matchReason"],
       },
     },
-    analysis: { type: Type.STRING, description: "简短的分析理由，字数控制在50字以内" },
+    analysis: { type: Type.STRING, description: "简短分析理由" },
   },
   required: ["recommendations", "analysis"],
+};
+
+const normalizeText = (value: unknown) => String(value ?? '').trim().toLowerCase();
+
+const hasSpecialScene = (prefs: UserPreferences) => normalizeText(prefs.specialScene).length > 0;
+
+const getTasteScore = (product: RiceProduct, keywords: string[]) => {
+  const matched = product.tastes?.find(t => {
+    const indicatorName = String(t.tasteProfile?.indicatorName || '');
+    return keywords.some(keyword => indicatorName.includes(keyword));
+  });
+  return Number(matched?.score || 0);
+};
+
+const formatInventoryForPrompt = (inventory: RiceProduct[]) => {
+  return inventory.map(p => {
+    const tastes = p.tastes?.map(t => `${t.tasteProfile?.indicatorName}:${t.score}`).join(',');
+    return `编号:${p.id}|名称:${p.name}|品牌:${p.brand}|品种:${p.variety?.name || ''}|产地:${p.origin?.province || ''}|土壤:${p.origin?.soilType || ''}|价格:${p.price}元/kg|口感:${tastes || ''}|烹饪方式:${p.cookingMethod?.methodName || ''}`;
+  }).join('\n');
+};
+
+const getLocalRecommendationResult = (
+  prefs: UserPreferences,
+  inventory: RiceProduct[],
+  analysis = "未输入特殊场景，已按本地数据库参数为您推荐稻米。"
+): RecommendationResponse => {
+  const originQuery = normalizeText(prefs.origin);
+  const requirementQuery = normalizeText(prefs.requirements);
+  const minPrice = Number.isFinite(Number(prefs.minPrice)) ? Number(prefs.minPrice) : 0;
+  const maxPrice = Number.isFinite(Number(prefs.maxPrice)) && Number(prefs.maxPrice) > 0
+    ? Number(prefs.maxPrice)
+    : Number.POSITIVE_INFINITY;
+
+  const scored = inventory.map(product => {
+    let score = 0;
+    const province = normalizeText(product.origin?.province);
+    const varietyName = normalizeText(product.variety?.name || product.varietyName);
+    const name = normalizeText(product.name);
+    const description = normalizeText(product.description);
+    const tags = (product.tags || []).map(normalizeText);
+    const textureScore = getTasteScore(product, ['软糯', '软', '柔']);
+    const aromaScore = getTasteScore(product, ['米香', '香气', '香']);
+
+    if (product.price >= minPrice && product.price <= maxPrice) {
+      score += 35;
+      if (Number.isFinite(maxPrice) && maxPrice > minPrice) {
+        const middle = (minPrice + maxPrice) / 2;
+        score += Math.max(0, 15 - Math.abs(product.price - middle) * 2);
+      }
+    } else if (product.price <= maxPrice * 1.15 && product.price >= Math.max(0, minPrice * 0.85)) {
+      score += 12;
+    } else {
+      score -= 20;
+    }
+
+    if (!originQuery) {
+      score += 10;
+    } else if (province.includes(originQuery) || name.includes(originQuery)) {
+      score += 22;
+    }
+
+    if (prefs.texture === RiceTexture.SOFT) {
+      score += textureScore || (product.textureScore || 0);
+    } else if (prefs.texture === RiceTexture.FIRM) {
+      const raw = textureScore || (product.textureScore || 0);
+      score += Math.max(0, 100 - raw);
+    } else {
+      const raw = textureScore || (product.textureScore || 60);
+      score += Math.max(0, 30 - Math.abs(raw - 60));
+    }
+
+    if (prefs.aroma) {
+      score += (aromaScore || product.aromaScore || 0) * 0.5;
+    } else {
+      score += 8;
+    }
+
+    if (prefs.grainLength === RiceGrainLength.LONG) {
+      if (varietyName.includes('长') || name.includes('长') || varietyName.includes('籼')) score += 18;
+    } else if (prefs.grainLength === RiceGrainLength.SHORT) {
+      if (varietyName.includes('圆') || name.includes('圆') || varietyName.includes('粳')) score += 18;
+    } else if (prefs.grainLength === RiceGrainLength.MEDIUM) {
+      score += 10;
+    }
+
+    if (requirementQuery) {
+      const textBlob = `${name} ${varietyName} ${province} ${description} ${tags.join(' ')}`;
+      if (textBlob.includes(requirementQuery)) {
+        score += 15;
+      }
+    }
+
+    return { product, score };
+  });
+
+  const recommendations = scored
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 3)
+    .map(({ product }) => ({
+      ...product,
+      matchReason:
+        product.matchReason ||
+        `已按${prefs.origin ? '产地、' : ''}预算、口感${prefs.aroma ? '和香气' : ''}等参数从本地数据库筛选，匹配度较高。`
+    }));
+
+  return {
+    recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
+    analysis,
+  };
 };
 
 export const handleTextRecommendationRequest = async (prefs: UserPreferences, inventory: RiceProduct[]): Promise<RecommendationResponse> => {
@@ -55,34 +163,33 @@ export const handleTextRecommendationRequest = async (prefs: UserPreferences, in
     return cache.get(cacheKey);
   }
 
-  const inventoryStr = inventory.map(p => {
-    const tastes = p.tastes?.map(t => `${t.tasteProfile?.indicatorName}:${t.score}`).join(',');
-    return `编号:${p.id}|名称:${p.name}|品牌:${p.brand}|品种:${p.variety?.name}|产地:${p.origin?.province}|土壤:${p.origin?.soilType}|价格:${p.price}元/kg|口感:${tastes}|烹饪方式:${p.cookingMethod?.methodName}`;
-  }).join('\n');
+  if (!hasSpecialScene(prefs)) {
+    const result = getLocalRecommendationResult(prefs, inventory);
+    cache.set(cacheKey, result);
+    return result;
+  }
 
+  const inventoryStr = formatInventoryForPrompt(inventory);
   const prompt = `
-    作为稻米专家，请从以下库中匹配最适合的产品。
-
+    你是稻米推荐专家，请结合用户给出的特殊场景，从库存中挑选最适合的产品。
     用户偏好与约束：
     - 预算范围：${prefs.minPrice || 0} 到 ${prefs.maxPrice || '不限'} 元/kg
     - 产地要求：${prefs.origin || '不限'}
     - 口感偏好：${prefs.texture || '不限'}
     - 米粒形态：${prefs.grainLength || '不限'}
+    - 特殊场景：${prefs.specialScene || '无'}
     - 其他补充需求：${prefs.requirements || '无'}
 
-    现有库数据：
+    现有库存数据：
     ${inventoryStr}
 
     要求：
-    1. 严禁在生成的文本中包含任何 URL 链接。
-    2. 在 analysis 字段提供一段极其简短的分析理由（50字以内）。
-    3. 严禁提示用户"点击购买"、"跳转选购"，应引导用户根据推荐的品牌和产品全名自行了解。
-    4. 报告应聚焦于稻米本身的特质。
-
-    请以JSON格式返回：{"recommendations": [{"id": "产品ID", "matchReason": "推荐理由"}], "analysis": "简短分析"}
+    1. 只返回库存中存在的产品 ID。
+    2. 返回 JSON：{"recommendations":[{"id":"产品ID","matchReason":"推荐理由"}],"analysis":"简短分析"}。
+    3. 不要包含 URL，不要引导用户点击购买。
+    4. 分析聚焦在场景与稻米本身的匹配逻辑。
   `;
 
-  // 尝试使用Gemini
   try {
     const ai = getAIClient();
     const response = await ai.models.generateContent({
@@ -103,15 +210,14 @@ export const handleTextRecommendationRequest = async (prefs: UserPreferences, in
       .filter((item: any) => item !== null);
 
     const result = {
-      recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
-      analysis: parsed.analysis || "根据您的偏好，我们为您挑选了口感最为契合的稻米品种。您可以根据产品详情了解它们的特色。"
+      recommendations: recommendations.length > 0 ? recommendations : getLocalRecommendationResult(prefs, inventory).recommendations,
+      analysis: parsed.analysis || "已结合特殊场景为您完成场景化推荐。",
     };
     cache.set(cacheKey, result);
     return result;
   } catch (geminiError) {
     console.warn('Gemini API unavailable, switching to DeepSeek:', geminiError);
 
-    // 切换到DeepSeek
     try {
       const deepseek = getDeepSeekClient();
       const response = await deepseek.chat.completions.create({
@@ -123,7 +229,6 @@ export const handleTextRecommendationRequest = async (prefs: UserPreferences, in
 
       const content = response.choices[0]?.message?.content || '{}';
       const parsed = JSON.parse(content);
-
       const recommendations = (parsed.recommendations || [])
         .map((rec: any) => {
           const product = inventory.find(p => p.id === rec.id);
@@ -132,18 +237,18 @@ export const handleTextRecommendationRequest = async (prefs: UserPreferences, in
         .filter((item: any) => item !== null);
 
       const result = {
-        recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
-        analysis: parsed.analysis || "根据您的偏好，我们为您挑选了口感最为契合的稻米品种。您可以根据产品详情了解它们的特色。"
+        recommendations: recommendations.length > 0 ? recommendations : getLocalRecommendationResult(prefs, inventory).recommendations,
+        analysis: parsed.analysis || "已结合特殊场景为您完成场景化推荐。",
       };
       cache.set(cacheKey, result);
       return result;
     } catch (deepseekError) {
       console.error('Both Gemini and DeepSeek APIs failed:', deepseekError);
-      // 返回默认推荐
-      const result = {
-        recommendations: inventory.slice(0, 3),
-        analysis: "AI服务暂时不可用，已为您推荐热门产品。"
-      };
+      const result = getLocalRecommendationResult(
+        prefs,
+        inventory,
+        "特殊场景分析服务暂时不可用，已切换为本地数据库参数匹配结果。"
+      );
       cache.set(cacheKey, result);
       return result;
     }
@@ -151,30 +256,22 @@ export const handleTextRecommendationRequest = async (prefs: UserPreferences, in
 };
 
 export const handleImageAnalysisRequest = async (base64Image: string, inventory: RiceProduct[]): Promise<RecommendationResponse> => {
-  const cacheKey = getCacheKey('image', { base64Image: base64Image.substring(0, 100) }, inventory); // 简化缓存键
+  const cacheKey = getCacheKey('image', { base64Image: base64Image.substring(0, 100) }, inventory);
   if (cache.has(cacheKey)) {
     return cache.get(cacheKey);
   }
 
-  const inventoryStr = inventory.map(p => {
-    const tastes = p.tastes?.map(t => `${t.tasteProfile?.indicatorName}:${t.score}`).join(',');
-    return `编号:${p.id}|名称:${p.name}|品牌:${p.brand}|品种:${p.variety?.name}|产地:${p.origin?.province}|价格:${p.price}元/kg|口感:${tastes}`;
-  }).join('\n');
-
+  const inventoryStr = formatInventoryForPrompt(inventory);
   const promptText = `
-          分析图中菜肴的口味特征，并从以下稻米库中推荐最适合搭配的米种：
-          ${inventoryStr}
+    分析图片中的菜肴风味特征，并从以下稻米库存中推荐最适合搭配的产品：
+    ${inventoryStr}
 
-          要求：
-          1. 严禁提供任何可点击的 URL。
-          2. analysis 字段提供一段极其简短的分析理由（50字以内），聚焦于风味搭配。
-          3. 不要引导用户跳转，仅说明大米的品种特色。
-          4. 语气应自然、生活化。
-
-          请以JSON格式返回：{"recommendations": [{"id": "产品ID", "matchReason": "推荐理由"}], "analysis": "简短分析"}
+    要求：
+    1. 只返回库存中存在的产品 ID。
+    2. 返回 JSON：{"recommendations":[{"id":"产品ID","matchReason":"推荐理由"}],"analysis":"简短分析"}。
+    3. 不包含 URL。
   `;
 
-  // 尝试使用Gemini（支持图像）
   try {
     const ai = getAIClient();
     const response = await ai.models.generateContent({
@@ -192,7 +289,6 @@ export const handleImageAnalysisRequest = async (base64Image: string, inventory:
     });
 
     const parsed = JSON.parse(response.text || "{}");
-
     const recommendations = (parsed.recommendations || [])
       .map((rec: any) => {
         const product = inventory.find(p => p.id === rec.id);
@@ -202,17 +298,16 @@ export const handleImageAnalysisRequest = async (base64Image: string, inventory:
 
     const result = {
       recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
-      analysis: parsed.analysis || "这款菜肴的味道浓郁，搭配我们为您选出的米种能带来更好的味觉平衡。您可以根据产品全名进一步了解这些品种。"
+      analysis: parsed.analysis || "已根据菜肴图像为您完成搭配推荐。",
     };
     cache.set(cacheKey, result);
     return result;
   } catch (geminiError) {
     console.warn('Gemini API unavailable for image analysis:', geminiError);
 
-    // DeepSeek不支持图像，降级到文本推荐
     try {
       const deepseek = getDeepSeekClient();
-      const textPrompt = `基于菜肴描述（假设为中式家常菜），推荐适合搭配的稻米：${inventoryStr}`;
+      const textPrompt = `假设图片内容为一款常见家常菜，请从以下库存中推荐适合搭配的稻米：\n${inventoryStr}`;
       const response = await deepseek.chat.completions.create({
         model: 'deepseek-chat',
         messages: [{ role: 'user', content: textPrompt }],
@@ -222,7 +317,6 @@ export const handleImageAnalysisRequest = async (base64Image: string, inventory:
 
       const content = response.choices[0]?.message?.content || '{}';
       const parsed = JSON.parse(content);
-
       const recommendations = (parsed.recommendations || [])
         .map((rec: any) => {
           const product = inventory.find(p => p.id === rec.id);
@@ -232,16 +326,15 @@ export const handleImageAnalysisRequest = async (base64Image: string, inventory:
 
       const result = {
         recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
-        analysis: parsed.analysis || "这款菜肴的味道浓郁，搭配我们为您选出的米种能带来更好的味觉平衡。您可以根据产品全名进一步了解这些品种。"
+        analysis: parsed.analysis || "图像识别服务降级，已按常见菜肴搭配逻辑为您推荐。",
       };
       cache.set(cacheKey, result);
       return result;
     } catch (deepseekError) {
       console.error('Both APIs failed for image analysis:', deepseekError);
-      // 返回默认推荐
       const result = {
         recommendations: inventory.slice(0, 3),
-        analysis: "图像分析服务暂时不可用，已为您推荐热门米种。"
+        analysis: "图像分析服务暂时不可用，已为您展示本地热门稻米。",
       };
       cache.set(cacheKey, result);
       return result;
@@ -255,32 +348,20 @@ export const handleDailySelectionRequest = async (favorites: RiceProduct[], inve
     return cache.get(cacheKey);
   }
 
-  const inventoryStr = inventory.map(p => {
-    const tastes = p.tastes?.map(t => `${t.tasteProfile?.indicatorName}:${t.score}`).join(',');
-    return `编号:${p.id}|名称:${p.name}|品牌:${p.brand}|品种:${p.variety?.name}|产地:${p.origin?.province}|价格:${p.price}元/kg|口感:${tastes}`;
-  }).join('\n');
-
-  const favoritesStr = favorites.map(p => `${p.name}(${p.variety?.name}, ${p.origin?.province})`).join(', ');
-
+  const inventoryStr = formatInventoryForPrompt(inventory);
+  const favoritesStr = favorites.map(p => `${p.name}(${p.variety?.name || ''}, ${p.origin?.province || ''})`).join(', ');
   const prompt = `
-    作为稻米专家，请根据用户已收藏的稻米产品，从库中推荐 3-5 款相似或互补的优质稻米作为"每日优选"。
-
-    用户已收藏的产品：
-    ${favoritesStr || '暂无收藏（请推荐当前库中最优质、最受欢迎的品种）'}
-
-    现有库数据：
+    你是稻米推荐专家，请根据用户已收藏的稻米产品，从库存中推荐 3 到 5 款适合作为“每日优选”的产品。
+    用户已收藏：${favoritesStr || '暂无收藏，请推荐当前库存中综合表现较好的产品。'}
+    库存：
     ${inventoryStr}
 
     要求：
-    1. 严禁在生成的文本中包含任何 URL 链接。
-    2. 在 analysis 字段提供一段极其简短的分析理由（50字以内），说明为什么这些是今天的优选。
-    3. 推荐理由 matchReason 应说明与用户收藏的关联性或该品种的独特优势。
-    4. 严禁提示用户"点击购买"，应引导用户自行了解。
-
-    请以JSON格式返回：{"recommendations": [{"id": "产品ID", "matchReason": "推荐理由"}], "analysis": "简短分析"}
+    1. 只返回库存中存在的产品 ID。
+    2. 返回 JSON：{"recommendations":[{"id":"产品ID","matchReason":"推荐理由"}],"analysis":"简短分析"}。
+    3. 不要包含 URL。
   `;
 
-  // 尝试使用Gemini
   try {
     const ai = getAIClient();
     const response = await ai.models.generateContent({
@@ -293,7 +374,6 @@ export const handleDailySelectionRequest = async (favorites: RiceProduct[], inve
     });
 
     const parsed = JSON.parse(response.text || "{}");
-
     const recommendations = (parsed.recommendations || [])
       .map((rec: any) => {
         const product = inventory.find(p => p.id === rec.id);
@@ -303,14 +383,13 @@ export const handleDailySelectionRequest = async (favorites: RiceProduct[], inve
 
     const result = {
       recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
-      analysis: parsed.analysis || "根据您的收藏偏好，我们为您精选了今日最值得尝试的优质稻米。"
+      analysis: parsed.analysis || "已根据您的收藏偏好生成今日优选。",
     };
     cache.set(cacheKey, result);
     return result;
   } catch (geminiError) {
     console.warn('Gemini API unavailable, switching to DeepSeek:', geminiError);
 
-    // 切换到DeepSeek
     try {
       const deepseek = getDeepSeekClient();
       const response = await deepseek.chat.completions.create({
@@ -322,7 +401,6 @@ export const handleDailySelectionRequest = async (favorites: RiceProduct[], inve
 
       const content = response.choices[0]?.message?.content || '{}';
       const parsed = JSON.parse(content);
-
       const recommendations = (parsed.recommendations || [])
         .map((rec: any) => {
           const product = inventory.find(p => p.id === rec.id);
@@ -332,16 +410,15 @@ export const handleDailySelectionRequest = async (favorites: RiceProduct[], inve
 
       const result = {
         recommendations: recommendations.length > 0 ? recommendations : inventory.slice(0, 3),
-        analysis: parsed.analysis || "根据您的收藏偏好，我们为您精选了今日最值得尝试的优质稻米。"
+        analysis: parsed.analysis || "已根据您的收藏偏好生成今日优选。",
       };
       cache.set(cacheKey, result);
       return result;
     } catch (deepseekError) {
       console.error('Both Gemini and DeepSeek APIs failed:', deepseekError);
-      // 返回默认推荐
       const result = {
         recommendations: inventory.slice(0, 3),
-        analysis: "AI服务暂时不可用，已为您推荐热门产品。"
+        analysis: "每日优选服务暂时不可用，已为您展示本地热门稻米。",
       };
       cache.set(cacheKey, result);
       return result;
@@ -352,8 +429,7 @@ export const handleDailySelectionRequest = async (favorites: RiceProduct[], inve
 export const handleSmartSpecsRequest = async (productInfo: { name: string, variety: string, origin: string, description: string }): Promise<any> => {
   const ai = getAIClient();
   const prompt = `
-    作为一名高级评米师，请根据以下大米信息，科学推断其口感指标和烹饪参数。
-
+    你是一名高级评米师，请根据以下大米信息，科学推断其口感指标和烹饪参数。
     产品信息：
     - 名称：${productInfo.name}
     - 品种：${productInfo.variety}
@@ -363,15 +439,10 @@ export const handleSmartSpecsRequest = async (productInfo: { name: string, varie
     请给出：
     1. 软糯度评分 (0-100)
     2. 米香浓度评分 (0-100)
-    3. 最佳米水比 (格式如 1:1.2)
-    4. 最适合的烹饪方式ID (M001:电饭煲, M002:木桶蒸, M003:煮粥)
-    5. 详细口感评分 (T001:软糯度, T002:米香浓度, T003:回甘度)
-    6. 专业的商品描述 (100字以内，突出其品种特色和口感)
-
-    要求：
-    - 评分应基于品种和产地的科学常识（例如：五常稻花香通常米香极高，软糯度适中偏高）。
-    - 描述应专业且吸引人。
-    - 严禁包含任何 URL。
+    3. 最佳米水比（格式如 1:1.2）
+    4. 最适合的烹饪方式 ID（M001/M002/M003）
+    5. 详细口感评分（T001/T002/T003）
+    6. 专业商品描述（100字以内）
   `;
 
   try {
@@ -413,7 +484,7 @@ export const handleSmartSpecsRequest = async (productInfo: { name: string, varie
       aromaScore: 70,
       cookingRatio: "1:1.2",
       cookingMethodId: "M001",
-      description: "优质稻米，口感佳。",
+      description: "优质稻米，口感均衡，适合日常家庭食用。",
       tastes: [
         { tasteId: "T001", score: 75 },
         { tasteId: "T002", score: 70 },
@@ -426,28 +497,21 @@ export const handleSmartSpecsRequest = async (productInfo: { name: string, varie
 export const handleBatchSmartSpecsRequest = async (products: any[]): Promise<any[]> => {
   const ai = getAIClient();
   const productsStr = products.map((p, i) =>
-    `[${i}] 名称:${p.name}, 品种:${p.variety?.name}, 产地:${p.origin?.province}, 描述:${p.description}`
+    `[${i}] 名称:${p.name}, 品种:${p.variety?.name || ''}, 产地:${p.origin?.province || ''}, 描述:${p.description || ''}`
   ).join('\n');
 
   const prompt = `
-    作为一名高级评米师，请根据以下多款大米的信息，科学推断它们的口感指标和烹饪参数。
-
+    你是一名高级评米师，请根据以下多款大米的信息，科学推断它们的口感指标和烹饪参数。
     待分析产品列表：
     ${productsStr}
 
-    请为每一款大米给出：
+    请为每款大米返回：
     1. 软糯度评分 (0-100)
     2. 米香浓度评分 (0-100)
-    3. 最佳米水比 (格式如 1:1.2)
-    4. 最适合的烹饪方式ID (M001:电饭煲, M002:木桶蒸, M003:煮粥)
-    5. 详细口感评分 (T001:软糯度, T002:米香浓度, T003:回甘度)
-    6. 专业的商品描述 (100字以内，突出其品种特色和口感)
-
-    要求：
-    - 严格按照输入的顺序返回一个 JSON 数组。
-    - 评分应基于品种和产地的科学常识。
-    - 描述应专业且吸引人。
-    - 严禁包含任何 URL。
+    3. 最佳米水比（格式如 1:1.2）
+    4. 最适合的烹饪方式 ID（M001/M002/M003）
+    5. 详细口感评分（T001/T002/T003）
+    6. 专业商品描述（100字以内）
   `;
 
   try {
@@ -492,7 +556,7 @@ export const handleBatchSmartSpecsRequest = async (products: any[]): Promise<any
       aromaScore: 70,
       cookingRatio: "1:1.2",
       cookingMethodId: "M001",
-      description: "优质稻米，口感佳。",
+      description: "优质稻米，口感均衡，适合日常家庭食用。",
       tastes: [
         { tasteId: "T001", score: 75 },
         { tasteId: "T002", score: 70 },

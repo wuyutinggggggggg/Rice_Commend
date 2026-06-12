@@ -7,8 +7,8 @@ import { RiceApi } from '../services/apiService.ts';
 interface AdminDashboardProps {
   onLogout: () => void;
   inventory: RiceProduct[];
-  onAddProduct: (product: RiceProduct) => void;
-  onUpdateProduct: (product: RiceProduct) => void;
+  onAddProduct: (product: RiceProduct) => void | Promise<void>;
+  onUpdateProduct: (product: RiceProduct) => void | Promise<void>;
   users: UserProfile[];
   onUpdateUsers: (users: UserProfile[]) => void;
   currentUser: UserProfile | null;
@@ -32,10 +32,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onLogout, inventory, on
     status: 'Active'
   });
 
-  const isAdmin = true;
+const isAdmin = true;
   const themeColorClass = 'amber';
 
   const myInventory = inventory;
+  const normalizeProductText = (value: string | undefined) => String(value || '').replace(/\s+/g, '').trim().toLowerCase();
+  const getProductDedupKey = (product: Partial<RiceProduct>) => {
+    return `${normalizeProductText(product.name)}|${normalizeProductText(product.brand)}`;
+  };
 
   const [newProduct, setNewProduct] = useState<Partial<RiceProduct>>({
     name: '',
@@ -122,8 +126,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onLogout, inventory, on
     setEditingId(product.id);
     setNewProduct({ 
       ...product, 
-      varietyId: product.variety?.name || product.varietyId,
-      originId: product.origin?.province || product.originId,
+      varietyId: product.varietyId,
+      originId: product.originId,
       images: product.images || (product.packagingImage ? [product.packagingImage] : []) 
     });
     setShowAddModal(true);
@@ -231,9 +235,18 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onLogout, inventory, on
     );
   };
 
-  const handleSubmit = (e: React.FormEvent) => {
+const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!newProduct.name || !newProduct.originId) return;
+
+    const duplicateProduct = inventory.find(product =>
+      product.id !== editingId &&
+      getProductDedupKey(product) === getProductDedupKey(newProduct)
+    );
+    if (duplicateProduct) {
+      alert(`商品已存在：${duplicateProduct.name}`);
+      return;
+    }
 
     const finalImages = newProduct.images || [];
     const mainImg = finalImages.length > 0 ? finalImages[0] : '';
@@ -252,17 +265,17 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onLogout, inventory, on
     };
     const selectedMethod = cookingMethods.find(m => m.id === newProduct.cookingMethodId);
 
-    if (editingId) {
+  if (editingId) {
         const updatedProduct: RiceProduct = {
             ...newProduct as RiceProduct,
             id: editingId,
             packagingImage: mainImg,
             images: finalImages,
-            origin: selectedOrigin,
+         origin: selectedOrigin,
             variety: selectedVariety,
             cookingMethod: selectedMethod
         };
-        onUpdateProduct(updatedProduct);
+        await onUpdateProduct(updatedProduct);
     } else {
         const productToAdd: RiceProduct = {
             id: `R${Math.floor(Math.random() * 10000).toString().padStart(3, '0')}`,
@@ -286,7 +299,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onLogout, inventory, on
             variety: selectedVariety,
             cookingMethod: selectedMethod
         };
-        onAddProduct(productToAdd);
+        await onAddProduct(productToAdd);
     }
 
     setShowAddModal(false);
@@ -349,6 +362,9 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onLogout, inventory, on
     item.name.toLowerCase().includes(productSearch.toLowerCase()) || 
     item.brand.toLowerCase().includes(productSearch.toLowerCase()) ||
     item.id.toLowerCase().includes(productSearch.toLowerCase())
+  );
+  const dedupedInventory = filteredInventory.filter((item, index, list) =>
+    index === list.findIndex(candidate => getProductDedupKey(candidate) === getProductDedupKey(item))
   );
 
   return (

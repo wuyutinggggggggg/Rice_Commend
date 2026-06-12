@@ -12,6 +12,12 @@ interface ResultsGridProps {
   onProductHover?: (product: RiceProduct | null) => void;
 }
 
+const toPercent = (score: unknown) => {
+  const raw = Number(score);
+  if (!Number.isFinite(raw)) return 0;
+  return Math.max(0, Math.min(100, Math.round(raw)));
+};
+
 interface ProductDetailModalProps {
   product: RiceProduct;
   onClose: () => void;
@@ -116,7 +122,7 @@ export const ProductDetailModal: React.FC<ProductDetailModalProps> = ({ product,
                   <h4 className="text-xs font-black text-gray-900 uppercase tracking-widest">产品风味与品种</h4>
                   <div className="text-sm text-gray-500 leading-relaxed border-l-4 border-emerald-100 pl-4 space-y-2">
                     <p><span className="font-bold text-gray-700">品种：</span>{product.variety?.name}</p>
-                    <p><span className="font-bold text-gray-700">产地详情：</span>{product.origin?.province} (土壤: {product.origin?.soilType})</p>
+                    <p><span className="font-bold text-gray-700">产地详情：</span>{product.origin?.province}</p>
                     <p>{product.description}</p>
                   </div>
                </div>
@@ -124,17 +130,20 @@ export const ProductDetailModal: React.FC<ProductDetailModalProps> = ({ product,
                <div className="space-y-3">
                   <h4 className="text-xs font-black text-gray-900 uppercase tracking-widest">口感指标</h4>
                   <div className="grid grid-cols-1 gap-2">
-                    {product.tastes?.map(t => (
-                      <div key={t.tasteId} className="space-y-1">
-                        <div className="flex justify-between text-[10px] font-bold text-gray-500">
-                          <span>{t.tasteProfile?.indicatorName}</span>
-                          <span>{t.score}%</span>
+                    {product.tastes?.map(t => {
+                      const label = t.tasteProfile?.indicatorName || t.tasteId;
+                      return (
+                        <div key={t.tasteId} className="space-y-1">
+                          <div className="flex justify-between text-[10px] font-bold text-gray-500">
+                            <span>{label}</span>
+                            <span>{toPercent(t.score)}%</span>
+                          </div>
+                          <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden">
+                            <div className="h-full bg-emerald-500" style={{ width: `${toPercent(t.score)}%` }}></div>
+                          </div>
                         </div>
-                        <div className="w-full h-1 bg-gray-100 rounded-full overflow-hidden">
-                          <div className="h-full bg-emerald-500" style={{ width: `${t.score}%` }}></div>
-                        </div>
-                      </div>
-                    ))}
+                      );
+                    })}
                   </div>
                </div>
 
